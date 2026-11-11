@@ -1,12 +1,14 @@
 /*
- * receptor.c — Etapa 1: Recepção e reprodução de áudio via RTP/UDP
+ * receptor.c — Etapa 2: Recepção de áudio RTP/UDP com controle de jitter
  *
  * Fluxo:
- *   udpsrc(porta, caps RTP) -> rtpL16depay -> queue -> audioconvert
- *                           -> audioresample -> autoaudiosink
+ *   udpsrc(porta, caps RTP) -> rtpjitterbuffer(latency) -> rtpL16depay
+ *         -> queue -> audioconvert -> audioresample -> autoaudiosink
  *
  * Uso:
- *   ./receptor [porta]
+ *   ./receptor [porta] [latencia_ms]
+ *     porta       padrão: 5000
+ *     latencia_ms padrão: 200 (tamanho do buffer de jitter, em ms)
  */
 #include <gst/gst.h>
 #include <glib-unix.h>
@@ -21,6 +23,10 @@
 
 /* Tempo sem pacotes até o udpsrc emitir a mensagem "GstUDPSrcTimeout" */
 #define UDP_TIMEOUT_NS  (3 * GST_SECOND)
+
+/* Latência padrão do rtpjitterbuffer e limite aceito pela linha de comando */
+#define DEFAULT_JITTER_LATENCY_MS  200
+#define MAX_JITTER_LATENCY_MS      10000
 
 typedef struct _CustomData {
   GstElement *pipeline;
@@ -38,6 +44,22 @@ first_packet_probe (GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
     g_print ("[RX] Recebendo pacotes RTP.\n");
   }
   return GST_PAD_PROBE_OK;
+}
+
+/* Consulta a latência total do pipeline (jitterbuffer + placa de som etc.).
+ * Útil para comparar as configurações no relatório. */
+static void
+report_pipeline_latency (GstElement *pipeline)
+{
+  GstQuery *query = gst_query_new_latency ();
+  if (gst_element_query (pipeline, query)) {
+    gboolean live;
+    GstClockTime min_lat, max_lat;
+    gst_query_parse_latency (query, &live, &min_lat, &max_lat);
+    g_print ("[RX] Latência do pipeline: live=%s, mínima=%" G_GUINT64_FORMAT " ms\n",
+        live ? "sim" : "não", (guint64) (min_lat / GST_MSECOND));
+  }
+  gst_query_unref (query);
 }
 
 static gboolean
@@ -88,6 +110,8 @@ bus_call (GstBus *bus, GstMessage *msg, gpointer user_data)
         gst_message_parse_state_changed (msg, &old_s, &new_s, &pending);
         g_print ("[RX] Pipeline: %s -> %s\n",
             gst_element_state_get_name (old_s), gst_element_state_get_name (new_s));
+        if (new_s == GST_STATE_PLAYING)
+          report_pipeline_latency (data->pipeline);
       }
       break;
     default:
@@ -116,16 +140,29 @@ parse_port (const gchar *str, gint *out)
   return TRUE;
 }
 
+static gboolean
+parse_latency (const gchar *str, guint *out)
+{
+  gchar *end = NULL;
+  guint64 v = g_ascii_strtoull (str, &end, 10);
+  if (end == str || *end != '\0' || v > MAX_JITTER_LATENCY_MS)
+    return FALSE;
+  *out = (guint) v;
+  return TRUE;
+}
+
 int
 tutorial_main (int argc, char *argv[])
 {
   CustomData data = { 0 };
-  GstElement *udp_src, *depayloader, *queue, *audio_convert, *audio_resample, *audio_sink;
+  GstElement *udp_src, *jitterbuffer, *depayloader, *queue;
+  GstElement *audio_convert, *audio_resample, *audio_sink;
   GstCaps *rtp_caps;
   GstPad *src_pad;
   GstBus *bus;
   GstStateChangeReturn ret;
   gint port = DEFAULT_PORT;
+  guint latency_ms = DEFAULT_JITTER_LATENCY_MS;
   int exit_code = 0;
 
   gst_init (&argc, &argv);
@@ -134,21 +171,29 @@ tutorial_main (int argc, char *argv[])
     g_printerr ("Porta inválida: '%s' (use 1-65535).\n", argv[1]);
     return EXIT_FAILURE;
   }
+  if (argc > 2 && !parse_latency (argv[2], &latency_ms)) {
+    g_printerr ("Latência inválida: '%s' (use 0-%d ms).\n",
+        argv[2], MAX_JITTER_LATENCY_MS);
+    return EXIT_FAILURE;
+  }
 
   /* ---------- Elementos ---------- */
-  udp_src        = gst_element_factory_make ("udpsrc",        "udp_src");
-  depayloader    = gst_element_factory_make ("rtpL16depay",   "rtp_depayloader");
+  udp_src        = gst_element_factory_make ("udpsrc",          "udp_src");
+  /* Armazena e reordena pacotes pelo número de sequência RTP e os libera
+   * segundo o timestamp, absorvendo variações de atraso (jitter) da rede */
+  jitterbuffer   = gst_element_factory_make ("rtpjitterbuffer", "rtp_jitterbuffer");
+  depayloader    = gst_element_factory_make ("rtpL16depay",     "rtp_depayloader");
   /* Desacopla a thread de rede da thread de reprodução e absorve a latência
    * do buffer da placa de som (evita aviso "please add queues") */
-  queue          = gst_element_factory_make ("queue",         "rx_queue");
-  audio_convert  = gst_element_factory_make ("audioconvert",  "audio_convert");
-  audio_resample = gst_element_factory_make ("audioresample", "audio_resample");
-  audio_sink     = gst_element_factory_make ("autoaudiosink", "audio_sink");
+  queue          = gst_element_factory_make ("queue",           "rx_queue");
+  audio_convert  = gst_element_factory_make ("audioconvert",    "audio_convert");
+  audio_resample = gst_element_factory_make ("audioresample",   "audio_resample");
+  audio_sink     = gst_element_factory_make ("autoaudiosink",   "audio_sink");
 
   data.pipeline = gst_pipeline_new ("receptor-pipeline");
 
-  if (!data.pipeline || !udp_src || !depayloader || !queue || !audio_convert ||
-      !audio_resample || !audio_sink) {
+  if (!data.pipeline || !udp_src || !jitterbuffer || !depayloader || !queue ||
+      !audio_convert || !audio_resample || !audio_sink) {
     g_printerr ("Nem todos os elementos puderam ser criados "
                 "(verifique gst-plugins-base/good).\n");
     return EXIT_FAILURE;
@@ -171,11 +216,15 @@ tutorial_main (int argc, char *argv[])
       NULL);
   gst_caps_unref (rtp_caps);
 
-  gst_bin_add_many (GST_BIN (data.pipeline), udp_src, depayloader, queue,
-      audio_convert, audio_resample, audio_sink, NULL);
+  /* latency (ms): quanto tempo o pacote pode esperar no buffer antes de ser
+   * liberado. Maior = mais tolerância a jitter, porém maior atraso fim-a-fim. */
+  g_object_set (jitterbuffer, "latency", latency_ms, NULL);
 
-  if (!gst_element_link_many (udp_src, depayloader, queue, audio_convert,
-          audio_resample, audio_sink, NULL)) {
+  gst_bin_add_many (GST_BIN (data.pipeline), udp_src, jitterbuffer, depayloader,
+      queue, audio_convert, audio_resample, audio_sink, NULL);
+
+  if (!gst_element_link_many (udp_src, jitterbuffer, depayloader, queue,
+          audio_convert, audio_resample, audio_sink, NULL)) {
     g_printerr ("Elementos não puderam ser linkados.\n");
     gst_object_unref (data.pipeline);
     return EXIT_FAILURE;
@@ -193,6 +242,7 @@ tutorial_main (int argc, char *argv[])
 
   g_print ("[RX] Escutando UDP na porta %d (RTP L16 %d Hz, %d canais, PT %d)\n",
       port, AUDIO_RATE, AUDIO_CHANNELS, RTP_PAYLOAD_TYPE);
+  g_print ("[RX] rtpjitterbuffer latency = %u ms\n", latency_ms);
 
   /* Falha aqui normalmente indica porta em uso ou sem permissão */
   ret = gst_element_set_state (data.pipeline, GST_STATE_PLAYING);
