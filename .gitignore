@@ -1,22 +1,49 @@
-# Ficheiros e Diretórios do CLion (JetBrains)
+# ---------- CLion / JetBrains ----------
 .idea/
 cmake-build-*/
+*.iml
 
-# Ficheiros de Configuração e Cache do CMake
+# ---------- Visual Studio / VS Code ----------
+.vs/
+out/
+build/
+CMakeUserPresets.json
+*.user
+*.suo
+*.vcxproj.filters
+.vscode/
+
+# ---------- Artefatos do CMake (build in-source acidental) ----------
 CMakeCache.txt
 CMakeFiles/
-Makefile
 cmake_install.cmake
-*.cmake
+CTestTestfile.cmake
+Makefile
+compile_commands.json
+_deps/
 
-# Binários Compilados e Objetos C/C++
+# ---------- Executáveis e binários compilados ----------
+/transmissor
+/receptor
+/pipeline_atividade2_a
+/pipeline_atividade2_b
+/flashback_pipeline
+*.exe
+*.pdb
+*.ilk
+*.obj
 *.o
+*.a
+*.so
+*.dll
 *.out
-pipeline_atividade2_a
-pipeline_atividade2_b
-flashback_pipeline
 
-# Mídia (Evita fazer commit acidental de vídeos/áudios pesados)
+# ---------- Logs e temporários ----------
+*.log
+*~
+*.swp
+
+# ---------- Mídia pesada (evita commit acidental) ----------
 *.webm
 *.mp4
 *.mkv
